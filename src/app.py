@@ -103,21 +103,24 @@ def extract_interviewee(filename: str) -> str:
 
 def ensure_openai_client():
     load_dotenv()
-    # Prefer Streamlit Secrets in the cloud; fall back to .env locally.
     api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         st.error("Missing OPENAI_API_KEY. Set it in Streamlit secrets or a local .env file.")
         st.stop()
 
-    # Try the modern client first. If the environment injects unsupported kwargs
-    # (e.g., 'proxies' on older builds), fall back to the module-level API.
+    # Primary path: modern client
     try:
         from openai import OpenAI as _OpenAI
-        return _OpenAI(api_key=api_key)
+        client = _OpenAI(api_key=api_key)  # some cloud images pass extra kwargs internally
+        _ = client.chat  # light sanity check
+        return client
     except TypeError as e:
-        # Fallback: module-level API works across many versions
+        # Fallback: module-level API (works even if the class init breaks)
         import openai as _openai
         _openai.api_key = api_key
+        # If you use a custom base URL, honor it:
+        if os.getenv("OPENAI_BASE_URL"):
+            _openai.base_url = os.getenv("OPENAI_BASE_URL")
         st.warning("Using OpenAI module-level client for compatibility.")
         return _openai
 
