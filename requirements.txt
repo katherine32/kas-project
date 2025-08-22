@@ -1,14 +1,9 @@
-# --- core ---
 streamlit==1.35.0
-openai==1.30.5
+openai==1.46.0
 numpy==1.26.4
 python-dotenv==1.0.1
-
-# --- app helpers ---
 tqdm==4.66.4
 srt==3.5.3
-
-# --- pin transitive deps to avoid recent breakages on Streamlit Cloud ---
 rich==13.7.1
 markdown-it-py==3.0.0
 mdurl==0.1.2
