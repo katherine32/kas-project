@@ -1,7 +1,14 @@
-faiss-cpu==1.12.0
-numpy==1.25.2
-numpydoc @ file:///Users/cbousseau/work/recipes/ci_py311/numpydoc_1677960919550/work
-openai==0.28.0
-openai-whisper @ git+https://github.com/openai/whisper.git@517a43ecd132a2089d85f4ebc044728a71d49f6e
-python-dotenv==1.1.1
-streamlit==1.29.0
+# --- core ---
+streamlit==1.35.0
+openai==1.30.5
+numpy==1.26.4
+python-dotenv==1.0.1
+
+# --- app helpers ---
+tqdm==4.66.4
+srt==3.5.3
+
+# --- pin transitive deps to avoid recent breakages on Streamlit Cloud ---
+rich==13.7.1
+markdown-it-py==3.0.0
+mdurl==0.1.2
