@@ -1,0 +1,2 @@
+[server]
+fileWatcherType = "none"   # or use "poll" if you prefer polling
