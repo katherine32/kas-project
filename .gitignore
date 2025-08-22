@@ -1,0 +1,19 @@
+
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local config
+.env
+
+# Data (keep code repo lean)
+data/srt/
+data/processed/
+data/embeddings/
+
+# OS/Editor
+.DS_Store
+.vscode/
+*.zip

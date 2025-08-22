@@ -1,0 +1,7 @@
+faiss-cpu==1.12.0
+numpy==1.25.2
+numpydoc @ file:///Users/cbousseau/work/recipes/ci_py311/numpydoc_1677960919550/work
+openai==0.28.0
+openai-whisper @ git+https://github.com/openai/whisper.git@517a43ecd132a2089d85f4ebc044728a71d49f6e
+python-dotenv==1.1.1
+streamlit==1.29.0
