@@ -26,6 +26,23 @@ TOP_K = 5
 CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
 
+def ensure_segments_on_disk():
+    """
+    If data/processed/segments.jsonl is missing (e.g., on Streamlit Cloud),
+    prompt the user to upload one and save it locally for this session.
+    """
+    if SEGMENTS_JSONL.exists():
+        return  # we’re good
+
+    st.info("No transcript data found. Upload your **segments.jsonl** to begin.")
+    uploaded = st.file_uploader("Upload segments.jsonl", type=["jsonl"])
+    if uploaded is None:
+        st.stop()  # wait for user to upload
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "segments.jsonl").write_bytes(uploaded.getvalue())
+    st.success("Uploaded! Please click **Rerun** at the top.")
+    st.stop()
 
 # ----------------------------
 # Utilities
@@ -228,6 +245,7 @@ def main():
     st.caption("Ask questions about a selected recording. Answers include timestamp citations.")
 
     client = ensure_openai_client()
+    ensure_segments_on_disk()
 
     if not SEGMENTS_JSONL.exists():
         st.error(f"Missing {SEGMENTS_JSONL}. Run src/parse_srt.py first.")
