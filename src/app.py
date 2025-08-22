@@ -7,6 +7,9 @@ from typing import List, Dict, Tuple
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
+import io, zipfile, srt
+from datetime import timedelta
+
 
 # --- OpenAI SDK v1 ---
 try:
@@ -27,16 +30,60 @@ CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
 
 def ensure_segments_on_disk():
+    """
+    If segments.jsonl is missing, let the user upload either:
+    - segments.jsonl, or
+    - a single .srt, or
+    - a .zip containing many .srt files.
+    Then build segments.jsonl here on the server.
+    """
     if SEGMENTS_JSONL.exists():
         return
-    st.info("No transcript data found. Upload your **segments.jsonl** to begin.")
-    uploaded = st.file_uploader("Upload segments.jsonl", type=["jsonl"])
+
+    st.info("No transcript data found. Upload your **segments.jsonl**, a single **.srt**, or a **.zip** of SRTs to begin.")
+    uploaded = st.file_uploader("Upload segments.jsonl / .srt / .zip", type=["jsonl", "srt", "zip"])
     if uploaded is None:
         st.stop()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "segments.jsonl").write_bytes(uploaded.getvalue())
-    st.success("Uploaded! Please click **Rerun**.")
-    st.stop()
+
+    name = uploaded.name.lower()
+
+    if name.endswith(".jsonl"):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "segments.jsonl").write_bytes(uploaded.getvalue())
+        st.success("segments.jsonl saved. Click **Rerun**.")
+        st.stop()
+
+    elif name.endswith(".srt"):
+        recs = _parse_srt_bytes(uploaded.name, uploaded.getvalue())
+        if not recs:
+            st.error("That .srt file contained no records.")
+            st.stop()
+        _write_segments_jsonl(recs)
+        st.success(f"Parsed {len(recs)} segments from {uploaded.name}. Click **Rerun**.")
+        st.stop()
+
+    elif name.endswith(".zip"):
+        # Parse all .srt files in the zip
+        buf = io.BytesIO(uploaded.getvalue())
+        with zipfile.ZipFile(buf) as zf:
+            recs_all = []
+            srt_names = [n for n in zf.namelist() if n.lower().endswith(".srt")]
+            if not srt_names:
+                st.error("No .srt files found in the .zip.")
+                st.stop()
+            for n in srt_names:
+                recs_all.extend(_parse_srt_bytes(Path(n).name, zf.read(n)))
+        if not recs_all:
+            st.error("Zip parsed but no segments found.")
+            st.stop()
+        _write_segments_jsonl(recs_all)
+        st.success(f"Parsed {len(recs_all)} segments from {len(srt_names)} SRT file(s). Click **Rerun**.")
+        st.stop()
+
+    else:
+        st.error("Unsupported file type. Upload .jsonl, .srt, or .zip.")
+        st.stop()
+
 
 # ----------------------------
 # Utilities
@@ -236,6 +283,40 @@ def answer_question(client, question: str, chunks: List[Dict], embs: np.ndarray,
     )
     ans = chat.choices[0].message.content.strip()
     return {"answer": ans, "used": top_chunks}
+
+
+def _td_to_ts(td: timedelta) -> str:
+    # HH:MM:SS,mmm
+    total_ms = int(td.total_seconds() * 1000)
+    ms = total_ms % 1000
+    s = (total_ms // 1000) % 60
+    m = (total_ms // 60000) % 60
+    h = total_ms // 3600000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def _parse_srt_bytes(filename: str, data: bytes) -> list[dict]:
+    """Return list of segment dicts matching your JSONL schema."""
+    text = data.decode("utf-8", errors="ignore")
+    records = []
+    for idx, sub in enumerate(srt.parse(text), start=1):
+        content = " ".join(line.strip() for line in str(sub.content).splitlines()).strip()
+        records.append({
+            "filename": filename,
+            "index": idx,
+            "start": sub.start.total_seconds(),
+            "end": sub.end.total_seconds(),
+            "start_ts": _td_to_ts(sub.start),
+            "end_ts": _td_to_ts(sub.end),
+            "text": content,
+        })
+    return records
+
+def _write_segments_jsonl(records: list[dict]):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = SEGMENTS_JSONL
+    with out.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 # ----------------------------
