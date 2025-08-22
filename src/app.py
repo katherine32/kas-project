@@ -27,21 +27,15 @@ CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
 
 def ensure_segments_on_disk():
-    """
-    If data/processed/segments.jsonl is missing (e.g., on Streamlit Cloud),
-    prompt the user to upload one and save it locally for this session.
-    """
     if SEGMENTS_JSONL.exists():
-        return  # we’re good
-
+        return
     st.info("No transcript data found. Upload your **segments.jsonl** to begin.")
     uploaded = st.file_uploader("Upload segments.jsonl", type=["jsonl"])
     if uploaded is None:
-        st.stop()  # wait for user to upload
-
+        st.stop()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "segments.jsonl").write_bytes(uploaded.getvalue())
-    st.success("Uploaded! Please click **Rerun** at the top.")
+    st.success("Uploaded! Please click **Rerun**.")
     st.stop()
 
 # ----------------------------
@@ -62,15 +56,23 @@ def extract_interviewee(filename: str) -> str:
 
 def ensure_openai_client():
     load_dotenv()
-    # Prefer Streamlit secrets in the cloud; fallback to .env locally
-    api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY", "")
+    # Prefer Streamlit Secrets in the cloud; fall back to .env locally.
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         st.error("Missing OPENAI_API_KEY. Set it in Streamlit secrets or a local .env file.")
         st.stop()
-    if not _HAS_OPENAI_V1:
-        st.error("OpenAI SDK v1 not found. Run: pip install openai")
-        st.stop()
-    return OpenAI(api_key=api_key)
+
+    # Try the modern client first. If the environment injects unsupported kwargs
+    # (e.g., 'proxies' on older builds), fall back to the module-level API.
+    try:
+        from openai import OpenAI as _OpenAI
+        return _OpenAI(api_key=api_key)
+    except TypeError as e:
+        # Fallback: module-level API works across many versions
+        import openai as _openai
+        _openai.api_key = api_key
+        st.warning("Using OpenAI module-level client for compatibility.")
+        return _openai
 
 
 def load_segments_for_file(filename: str) -> List[Dict]:
