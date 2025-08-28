@@ -11,6 +11,11 @@ from dotenv import load_dotenv
 import io, zipfile, srt
 from datetime import timedelta
 
+def _maybe_secret(key: str):
+    try:
+        return st.secrets[key]  # only if secrets.toml exists
+    except Exception:
+        return None
 
 # --- OpenAI SDK v1 ---
 try:
@@ -104,23 +109,28 @@ def extract_interviewee(filename: str) -> str:
 
 def ensure_openai_client():
     load_dotenv()
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+
+    # Prefer .env; fall back to st.secrets if available
+    api_key = os.getenv("OPENAI_API_KEY") or _maybe_secret("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL") or _maybe_secret("OPENAI_BASE_URL")
+
     if not api_key:
-        st.error("Missing OPENAI_API_KEY. Set it in Streamlit secrets or a local .env file.")
+        st.error(
+            "Missing OPENAI_API_KEY. Put it in a local `.env` OR in `.streamlit/secrets.toml`.\n\n"
+            "Example `.env`:\nOPENAI_API_KEY=sk-...  \n# (optional) OPENAI_BASE_URL=https://api.openai.com/v1"
+        )
         st.stop()
 
-    # Primary path: modern client
     try:
         from openai import OpenAI as _OpenAI
-        client = _OpenAI(api_key=api_key)  # some cloud images pass extra kwargs internally
+        client = _OpenAI(api_key=api_key, base_url=base_url) if base_url else _OpenAI(api_key=api_key)
         _ = client.chat  # light sanity check
         return client
     except TypeError:
-        # Fallback: module-level API (works even if the class init breaks)
         import openai as _openai
         _openai.api_key = api_key
-        if os.getenv("OPENAI_BASE_URL"):
-            _openai.base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url:
+            _openai.base_url = base_url
         st.warning("Using OpenAI module-level client for compatibility.")
         return _openai
 
