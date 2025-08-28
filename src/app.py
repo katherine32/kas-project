@@ -1,8 +1,9 @@
 # src/app.py
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 import numpy as np
 import streamlit as st
@@ -28,6 +29,7 @@ CHAT_MODEL = "gpt-4o-mini"               # good quality for demos
 TOP_K = 5
 CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
+
 
 def ensure_segments_on_disk():
     """
@@ -89,7 +91,6 @@ def ensure_segments_on_disk():
 # Utilities
 # ----------------------------
 import re
-from pathlib import Path
 
 def extract_interviewee(filename: str) -> str:
     """Pulls the name from filenames like LP_20151015_Haeng Soon Park_ENG.srt"""
@@ -114,36 +115,14 @@ def ensure_openai_client():
         client = _OpenAI(api_key=api_key)  # some cloud images pass extra kwargs internally
         _ = client.chat  # light sanity check
         return client
-    except TypeError as e:
+    except TypeError:
         # Fallback: module-level API (works even if the class init breaks)
         import openai as _openai
         _openai.api_key = api_key
-        # If you use a custom base URL, honor it:
         if os.getenv("OPENAI_BASE_URL"):
             _openai.base_url = os.getenv("OPENAI_BASE_URL")
         st.warning("Using OpenAI module-level client for compatibility.")
         return _openai
-
-
-def load_segments_for_file(filename: str) -> List[Dict]:
-    """
-    Read segments.jsonl and filter for the selected filename.
-    Each line has: {filename, index, start, end, start_ts, end_ts, text}
-    """
-    if not SEGMENTS_JSONL.exists():
-        st.error(f"Missing {SEGMENTS_JSONL}. Run your parser first.")
-        st.stop()
-
-    out = []
-    with SEGMENTS_JSONL.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("filename") == filename:
-                out.append(rec)
-    out.sort(key=lambda r: r.get("index", 0))
-    return out
 
 
 def merge_segments_to_chunks(
@@ -235,43 +214,38 @@ def search_topk_np(normed_embeddings: np.ndarray, query_vec: np.ndarray, k: int)
 
 def format_citations(chunks: List[Dict]) -> str:
     """
-    Create a short, citation-rich context with timestamps.
+    Create short, citation-rich context with interviewee + timestamps.
     """
     lines = []
     for ch in chunks:
+        who = ch.get("interviewee") or extract_interviewee(ch["filename"])
         ts = f"[{ch['start_ts']}–{ch['end_ts']}]"
         snippet = ch["text"]
         if len(snippet) > 400:
             snippet = snippet[:400].rstrip() + "…"
-        lines.append(f"{ts} {snippet}")
-    return "\n".join(lines)
-
-
-@st.cache_resource(show_spinner=False)
-def prepare_recording(_client, filename: str):
-    """Load segments → chunk → embed → build NumPy index (cached per filename)."""
-    segments = load_segments_for_file(filename)
-    chunks = merge_segments_to_chunks(segments)
-    texts  = [c["text"] for c in chunks]
-    embs   = embed_texts(_client, texts).astype("float32")
-    np_idx = build_index_np(embs.copy())
-    return chunks, embs, np_idx
+        lines.append(f"{who} — {Path(ch['filename']).stem} {ts}\n{snippet}")
+    return "\n\n".join(lines)
 
 
 def answer_question(client, question: str, chunks: List[Dict], embs: np.ndarray, np_index) -> Dict:
-    q_vec = embed_texts(client, [question]).astype("float32")  # (1, d)
+    q_vec = embed_texts(client, [question]).astype("float32")  # shape (1, d)
     if np_index is None or embs.shape[0] == 0:
-        return {"answer": "No content indexed for this recording.", "used": []}
+        return {"answer": "No content indexed.", "used": []}
 
-    k = min(TOP_K, embs.shape[0])
-    idx = search_topk_np(np_index, q_vec, k=k)
-    top_chunks = [chunks[int(i)] for i in idx]
+    # Pull a larger candidate set, then diversify by filename/interviewee
+    n = embs.shape[0]
+    k = min(TOP_K, n)
+    candidate_k = min(max(5 * k, k), n)
+    raw_idx = search_topk_np(np_index, q_vec, k=candidate_k)
+    sel_idx = diversify_indices(raw_idx, chunks, k=k, per_file_limit=3)
 
+    top_chunks = [chunks[int(i)] for i in sel_idx]
     context = format_citations(top_chunks)
+
     system = (
         "You are a helpful oral-history assistant. "
-        "Answer using ONLY the provided transcript context. "
-        "Cite timestamps like [HH:MM:SS,mmm–HH:MM:SS,mmm]. "
+        "Synthesize across multiple interviews, but answer using ONLY the provided transcript context. "
+        "Cite timestamps like [HH:MM:SS,mmm–HH:MM:SS,mmm] and include the interviewee name. "
         "If the answer isn’t in the context, say you don’t know."
     )
     user = f"Question: {question}\n\nContext:\n{context}"
@@ -297,10 +271,11 @@ def _td_to_ts(td: timedelta) -> str:
     h = total_ms // 3600000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def _parse_srt_bytes(filename: str, data: bytes) -> list[dict]:
+
+def _parse_srt_bytes(filename: str, data: bytes) -> List[Dict]:
     """Return list of segment dicts matching your JSONL schema."""
     text = data.decode("utf-8", errors="ignore")
-    records = []
+    records: List[Dict] = []
     for idx, sub in enumerate(srt.parse(text), start=1):
         content = " ".join(line.strip() for line in str(sub.content).splitlines()).strip()
         records.append({
@@ -314,7 +289,8 @@ def _parse_srt_bytes(filename: str, data: bytes) -> list[dict]:
         })
     return records
 
-def _write_segments_jsonl(records: list[dict]):
+
+def _write_segments_jsonl(records: List[Dict]):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out = SEGMENTS_JSONL
     with out.open("w", encoding="utf-8") as f:
@@ -323,67 +299,125 @@ def _write_segments_jsonl(records: list[dict]):
 
 
 # ----------------------------
+# Global-corpus helpers
+# ----------------------------
+def load_all_segments_grouped() -> Dict[str, List[Dict]]:
+    """
+    Read segments.jsonl and group records by filename.
+    Returns: {filename: [segment, ...]}
+    """
+    if not SEGMENTS_JSONL.exists():
+        st.error(f"Missing {SEGMENTS_JSONL}. Run your parser first.")
+        st.stop()
+
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+    with SEGMENTS_JSONL.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            fn = rec.get("filename")
+            if fn:
+                grouped[fn].append(rec)
+
+    # Sort each file's segments by index/time
+    for fn in grouped:
+        grouped[fn].sort(key=lambda r: r.get("index", 0))
+    return grouped
+
+
+def chunk_all_recordings(grouped: Dict[str, List[Dict]]) -> List[Dict]:
+    """
+    Chunk each recording separately, then flatten.
+    Each chunk carries filename + interviewee for citation.
+    """
+    all_chunks: List[Dict] = []
+    for fn, segs in grouped.items():
+        chs = merge_segments_to_chunks(segs)
+        for ch in chs:
+            ch["interviewee"] = extract_interviewee(fn)
+        all_chunks.extend(chs)
+    return all_chunks
+
+
+@st.cache_resource(show_spinner=False)
+def prepare_corpus(_client, _mtime_key: float):
+    """
+    Build a single corpus/index over all recordings.
+    Cache is invalidated when segments.jsonl mtime changes.
+    Returns: (chunks, embeddings, np_index)
+    """
+    grouped = load_all_segments_grouped()
+    chunks  = chunk_all_recordings(grouped)
+    texts   = [c["text"] for c in chunks]
+    embs    = embed_texts(_client, texts).astype("float32")
+    np_idx  = build_index_np(embs.copy())
+    return chunks, embs, np_idx
+
+
+def diversify_indices(idx: np.ndarray, chunks: List[Dict], k: int, per_file_limit: int = 3) -> List[int]:
+    """
+    Ensure synthesis across multiple interviews by limiting how many chunks
+    we take per filename. Feed in a slightly larger candidate list.
+    """
+    take: List[int] = []
+    counts: Dict[str, int] = defaultdict(int)
+    for i in idx:
+        fn = chunks[int(i)]["filename"]
+        if counts[fn] < per_file_limit:
+            take.append(int(i))
+            counts[fn] += 1
+            if len(take) >= k:
+                break
+    return take
+
+
+# ----------------------------
 # UI
 # ----------------------------
 def main():
-    st.set_page_config(page_title="KAS Chatbot (Demo)", page_icon="🎧", layout="wide")
+    st.set_page_config(page_title="Korean American Story — Chatbot Demo", page_icon="🎧", layout="wide")
     st.title("Korean American Story — Chatbot Demo 🎧")
-    st.caption("Ask questions about a selected recording. Answers include timestamp citations.")
+    st.caption("Ask questions about the full archive. Answers include interviewee + timestamp citations.")
 
     client = ensure_openai_client()
     ensure_segments_on_disk()
 
     if not SEGMENTS_JSONL.exists():
-        st.error(f"Missing {SEGMENTS_JSONL}. Run src/parse_srt.py first.")
+        st.error(f"Missing {SEGMENTS_JSONL}. Run your parser first.")
         st.stop()
 
-    # Collect available filenames from segments.jsonl
-    filenames = []
-    with SEGMENTS_JSONL.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            fn = rec.get("filename")
-            if fn:
-                filenames.append(fn)
-    filenames = sorted(set(filenames))
-    if not filenames:
+    # --- Global corpus: build one index over ALL recordings ---
+    with st.spinner("Preparing corpus (chunking + embeddings)…"):
+        mtime = SEGMENTS_JSONL.stat().st_mtime  # cache key so edits invalidate cleanly
+        chunks, embs, np_index = prepare_corpus(client, mtime)
+
+    if not chunks:
         st.error("No recordings found in segments.jsonl")
         st.stop()
 
-    sel = st.sidebar.selectbox("Select a recording", filenames, index=0)
+    # Optional: small sidebar info
     st.sidebar.write("Model:", CHAT_MODEL)
     st.sidebar.write("Embed:", EMBED_MODEL)
 
-    # --- announce selection changes in the chat ---
+    # Quick corpus summary
+    num_files = len({c["filename"] for c in chunks})
+    st.info(
+        f"Indexed **{num_files} recordings** into **{len(chunks)} chunks**. "
+        "Ask a question to synthesize across interviews; answers will cite interviewee + timestamps."
+    )
+
+    # -------- Chat history --------
     if "chat" not in st.session_state:
         st.session_state.chat = []
-    if "current_file" not in st.session_state:
-        st.session_state.current_file = sel
-        st.session_state.chat.append({
-            "role": "system",
-            "text": f"Switched recording to {extract_interviewee(sel)} (`{sel}`)"
-        })
-    elif sel != st.session_state.current_file:
-        st.session_state.current_file = sel
-        st.session_state.chat.append({
-            "role": "system",
-            "text": f"Switched recording to {extract_interviewee(sel)} (`{sel}`)"
-        })
 
-    with st.spinner("Preparing recording (chunking + embeddings)…"):
-        chunks, embs, np_index = prepare_recording(client, sel)
-
-    # -------- Chat history (handle system + regular turns) --------
     for turn in st.session_state.chat:
-        # System announcements
         if turn.get("role") == "system":
             with st.chat_message("system"):
                 st.markdown(f"**{turn.get('text','')}**")
             continue
 
-        # Regular Q/A turns (be tolerant of missing keys)
         if "q" in turn:
             with st.chat_message("user"):
                 st.markdown(turn["q"])
@@ -394,13 +428,15 @@ def main():
                 if used:
                     with st.expander("Cited segments"):
                         for i, c in enumerate(used, 1):
+                            who = c.get("interviewee") or extract_interviewee(c["filename"])
                             st.markdown(
-                                f"**{i}. {c['start_ts']}–{c['end_ts']}**  \n"
+                                f"**{i}. {who} — {Path(c['filename']).stem} "
+                                f"{c['start_ts']}–{c['end_ts']}**  \n"
                                 f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
                             )
 
     # -------- Chat input --------
-    q = st.chat_input("Ask about this recording…")
+    q = st.chat_input("Ask about the archive (e.g., themes of immigration, identity, foodways)…")
     if q:
         with st.chat_message("user"):
             st.markdown(q)
@@ -410,8 +446,10 @@ def main():
             st.markdown(out["answer"])
             with st.expander("Cited segments"):
                 for i, c in enumerate(out["used"], 1):
+                    who = c.get("interviewee") or extract_interviewee(c["filename"])
                     st.markdown(
-                        f"**{i}. {c['start_ts']}–{c['end_ts']}**  \n"
+                        f"**{i}. {who} — {Path(c['filename']).stem} "
+                        f"{c['start_ts']}–{c['end_ts']}**  \n"
                         f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
                     )
 
