@@ -10,12 +10,7 @@ import streamlit as st
 from dotenv import load_dotenv
 import io, zipfile, srt
 from datetime import timedelta
-
-def _maybe_secret(key: str):
-    try:
-        return st.secrets[key]  # only if secrets.toml exists
-    except Exception:
-        return None
+import re
 
 # --- OpenAI SDK v1 ---
 try:
@@ -35,13 +30,50 @@ TOP_K = 5
 CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
 
+# ----------------------------
+# Secrets / Env helpers
+# ----------------------------
+def _maybe_secret(key: str):
+    """Return st.secrets[key] if secrets.toml exists; otherwise None (no exception)."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return None
 
+def ensure_openai_client():
+    load_dotenv()  # load .env from project root
+    api_key = os.getenv("OPENAI_API_KEY") or _maybe_secret("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL") or _maybe_secret("OPENAI_BASE_URL")
+
+    if not api_key:
+        st.error(
+            "Missing OPENAI_API_KEY. Put it in a local `.env` or in `.streamlit/secrets.toml`.\n\n"
+            "Example `.env`:\nOPENAI_API_KEY=sk-...\n# (optional) OPENAI_BASE_URL=https://api.openai.com/v1"
+        )
+        st.stop()
+
+    try:
+        # Preferred: class client
+        from openai import OpenAI as _OpenAI
+        client = _OpenAI(api_key=api_key, base_url=base_url) if base_url else _OpenAI(api_key=api_key)
+        _ = client.chat  # light sanity check attr
+        return client
+    except TypeError:
+        # Fallback: module-level client
+        import openai as _openai
+        _openai.api_key = api_key
+        if base_url:
+            _openai.base_url = base_url
+        st.warning("Using OpenAI module-level client for compatibility.")
+        return _openai
+
+# ----------------------------
+# File bootstrap
+# ----------------------------
 def ensure_segments_on_disk():
     """
     If segments.jsonl is missing, let the user upload either:
-    - segments.jsonl, or
-    - a single .srt, or
-    - a .zip containing many .srt files.
+    - segments.jsonl, or a single .srt, or a .zip of SRTs.
     Then build segments.jsonl here on the server.
     """
     if SEGMENTS_JSONL.exists():
@@ -70,7 +102,6 @@ def ensure_segments_on_disk():
         st.stop()
 
     elif name.endswith(".zip"):
-        # Parse all .srt files in the zip
         buf = io.BytesIO(uploaded.getvalue())
         with zipfile.ZipFile(buf) as zf:
             recs_all = []
@@ -91,12 +122,9 @@ def ensure_segments_on_disk():
         st.error("Unsupported file type. Upload .jsonl, .srt, or .zip.")
         st.stop()
 
-
 # ----------------------------
 # Utilities
 # ----------------------------
-import re
-
 def extract_interviewee(filename: str) -> str:
     """Pulls the name from filenames like LP_20151015_Haeng Soon Park_ENG.srt"""
     base = Path(filename).stem
@@ -106,44 +134,12 @@ def extract_interviewee(filename: str) -> str:
     parts = base.split("_")
     return parts[2] if len(parts) >= 3 else base
 
-
-def ensure_openai_client():
-    load_dotenv()
-
-    # Prefer .env; fall back to st.secrets if available
-    api_key = os.getenv("OPENAI_API_KEY") or _maybe_secret("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL") or _maybe_secret("OPENAI_BASE_URL")
-
-    if not api_key:
-        st.error(
-            "Missing OPENAI_API_KEY. Put it in a local `.env` OR in `.streamlit/secrets.toml`.\n\n"
-            "Example `.env`:\nOPENAI_API_KEY=sk-...  \n# (optional) OPENAI_BASE_URL=https://api.openai.com/v1"
-        )
-        st.stop()
-
-    try:
-        from openai import OpenAI as _OpenAI
-        client = _OpenAI(api_key=api_key, base_url=base_url) if base_url else _OpenAI(api_key=api_key)
-        _ = client.chat  # light sanity check
-        return client
-    except TypeError:
-        import openai as _openai
-        _openai.api_key = api_key
-        if base_url:
-            _openai.base_url = base_url
-        st.warning("Using OpenAI module-level client for compatibility.")
-        return _openai
-
-
 def merge_segments_to_chunks(
     segments: List[Dict],
     target_chars: int = CHUNK_TARGET_CHARS,
     overlap_chars: int = CHUNK_OVERLAP_CHARS
 ) -> List[Dict]:
-    """
-    Merge consecutive subtitle segments into ~paragraph-sized chunks.
-    Keeps first/last timestamps for citation, preserves filename.
-    """
+    """Merge consecutive subtitle segments into ~paragraph-sized chunks."""
     chunks = []
     buf, buf_len = [], 0
     start_ts = end_ts = None
@@ -168,41 +164,37 @@ def merge_segments_to_chunks(
         seg = segments[i]
         seg_text = seg["text"]
         if not buf:
-            start_ts = seg["start_ts"]
-            start_sec = seg["start"]
-        end_ts = seg["end_ts"]
-        end_sec = seg["end"]
+            start_ts = seg["start_ts"]; start_sec = seg["start"]
+        end_ts = seg["end_ts"]; end_sec = seg["end"]
 
         if buf_len + len(seg_text) + 1 <= target_chars:
-            buf.append(seg_text)
-            buf_len += len(seg_text) + 1
-            i += 1
-            continue
+            buf.append(seg_text); buf_len += len(seg_text) + 1
+            i += 1; continue
 
-        # Buffer full -> flush, then overlap for smoothness
         flush()
         tail = (" ".join(buf))[-overlap_chars:] if overlap_chars > 0 else ""
-        buf = [tail] if tail else []
-        buf_len = len(tail)
-        start_ts = seg["start_ts"]
-        start_sec = seg["start"]
-        end_ts = seg["end_ts"]
-        end_sec = seg["end"]
+        buf = [tail] if tail else []; buf_len = len(tail)
+        start_ts = seg["start_ts"]; start_sec = seg["start"]
+        end_ts = seg["end_ts"]; end_sec = seg["end"]
 
     flush()
     return chunks
 
-
-def embed_texts(client, texts: List[str]) -> np.ndarray:
+# ---------- Embeddings (BATCHED to avoid 300k-token error) ----------
+def embed_texts(client, texts: List[str], batch_size: int = 128) -> np.ndarray:
     """
-    Returns a 2D numpy array (n x d) of embeddings (float32).
+    Return a 2D numpy array (n x d) of embeddings.
+    Batches requests to stay under provider token caps.
     """
     if not texts:
         return np.zeros((0, 1536), dtype="float32")
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    vecs = np.array([d.embedding for d in resp.data], dtype="float32")
-    return vecs
 
+    vecs_all = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        vecs_all.extend([d.embedding for d in resp.data])
+    return np.array(vecs_all, dtype="float32")
 
 # -------- NumPy-only cosine similarity "index" --------
 def build_index_np(embeddings: np.ndarray):
@@ -212,7 +204,6 @@ def build_index_np(embeddings: np.ndarray):
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
     return embeddings / norms
 
-
 def search_topk_np(normed_embeddings: np.ndarray, query_vec: np.ndarray, k: int):
     """Return indices of top-k cosine-similar rows to query_vec (shape: 1 x d)."""
     q = query_vec / (np.linalg.norm(query_vec, axis=1, keepdims=True) + 1e-12)
@@ -221,11 +212,8 @@ def search_topk_np(normed_embeddings: np.ndarray, query_vec: np.ndarray, k: int)
     return idx
 # ------------------------------------------------------
 
-
 def format_citations(chunks: List[Dict]) -> str:
-    """
-    Create short, citation-rich context with interviewee + timestamps.
-    """
+    """Create short, citation-rich context with interviewee + timestamps."""
     lines = []
     for ch in chunks:
         who = ch.get("interviewee") or extract_interviewee(ch["filename"])
@@ -236,13 +224,11 @@ def format_citations(chunks: List[Dict]) -> str:
         lines.append(f"{who} — {Path(ch['filename']).stem} {ts}\n{snippet}")
     return "\n\n".join(lines)
 
-
 def answer_question(client, question: str, chunks: List[Dict], embs: np.ndarray, np_index) -> Dict:
     q_vec = embed_texts(client, [question]).astype("float32")  # shape (1, d)
     if np_index is None or embs.shape[0] == 0:
         return {"answer": "No content indexed.", "used": []}
 
-    # Pull a larger candidate set, then diversify by filename/interviewee
     n = embs.shape[0]
     k = min(TOP_K, n)
     candidate_k = min(max(5 * k, k), n)
@@ -271,7 +257,6 @@ def answer_question(client, question: str, chunks: List[Dict], embs: np.ndarray,
     ans = chat.choices[0].message.content.strip()
     return {"answer": ans, "used": top_chunks}
 
-
 def _td_to_ts(td: timedelta) -> str:
     # HH:MM:SS,mmm
     total_ms = int(td.total_seconds() * 1000)
@@ -280,7 +265,6 @@ def _td_to_ts(td: timedelta) -> str:
     m = (total_ms // 60000) % 60
     h = total_ms // 3600000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
 
 def _parse_srt_bytes(filename: str, data: bytes) -> List[Dict]:
     """Return list of segment dicts matching your JSONL schema."""
@@ -299,7 +283,6 @@ def _parse_srt_bytes(filename: str, data: bytes) -> List[Dict]:
         })
     return records
 
-
 def _write_segments_jsonl(records: List[Dict]):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out = SEGMENTS_JSONL
@@ -307,15 +290,11 @@ def _write_segments_jsonl(records: List[Dict]):
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-
 # ----------------------------
 # Global-corpus helpers
 # ----------------------------
 def load_all_segments_grouped() -> Dict[str, List[Dict]]:
-    """
-    Read segments.jsonl and group records by filename.
-    Returns: {filename: [segment, ...]}
-    """
+    """Read segments.jsonl and group records by filename."""
     if not SEGMENTS_JSONL.exists():
         st.error(f"Missing {SEGMENTS_JSONL}. Run your parser first.")
         st.stop()
@@ -331,17 +310,12 @@ def load_all_segments_grouped() -> Dict[str, List[Dict]]:
             if fn:
                 grouped[fn].append(rec)
 
-    # Sort each file's segments by index/time
     for fn in grouped:
         grouped[fn].sort(key=lambda r: r.get("index", 0))
     return grouped
 
-
 def chunk_all_recordings(grouped: Dict[str, List[Dict]]) -> List[Dict]:
-    """
-    Chunk each recording separately, then flatten.
-    Each chunk carries filename + interviewee for citation.
-    """
+    """Chunk each recording separately, then flatten; attach interviewee."""
     all_chunks: List[Dict] = []
     for fn, segs in grouped.items():
         chs = merge_segments_to_chunks(segs)
@@ -350,27 +324,22 @@ def chunk_all_recordings(grouped: Dict[str, List[Dict]]) -> List[Dict]:
         all_chunks.extend(chs)
     return all_chunks
 
-
 @st.cache_resource(show_spinner=False)
 def prepare_corpus(_client, _mtime_key: float):
     """
     Build a single corpus/index over all recordings.
-    Cache is invalidated when segments.jsonl mtime changes.
+    Cache invalidates when segments.jsonl mtime changes.
     Returns: (chunks, embeddings, np_index)
     """
     grouped = load_all_segments_grouped()
     chunks  = chunk_all_recordings(grouped)
     texts   = [c["text"] for c in chunks]
-    embs    = embed_texts(_client, texts).astype("float32")
+    embs    = embed_texts(_client, texts).astype("float32")  # BATCHED
     np_idx  = build_index_np(embs.copy())
     return chunks, embs, np_idx
 
-
 def diversify_indices(idx: np.ndarray, chunks: List[Dict], k: int, per_file_limit: int = 3) -> List[int]:
-    """
-    Ensure synthesis across multiple interviews by limiting how many chunks
-    we take per filename. Feed in a slightly larger candidate list.
-    """
+    """Limit how many chunks we take per filename to encourage synthesis."""
     take: List[int] = []
     counts: Dict[str, int] = defaultdict(int)
     for i in idx:
@@ -381,7 +350,6 @@ def diversify_indices(idx: np.ndarray, chunks: List[Dict], k: int, per_file_limi
             if len(take) >= k:
                 break
     return take
-
 
 # ----------------------------
 # UI
@@ -395,21 +363,22 @@ def main():
     ensure_segments_on_disk()
 
     if not SEGMENTS_JSONL.exists():
-        st.error(f"Missing {SEGMENTS_JSONL}. Run your parser first.")
+        st.error(f"Missing {SEGMENTS_JSONL}. Run src/parse_srt.py first.")
         st.stop()
 
     # --- Global corpus: build one index over ALL recordings ---
     with st.spinner("Preparing corpus (chunking + embeddings)…"):
-        mtime = SEGMENTS_JSONL.stat().st_mtime  # cache key so edits invalidate cleanly
+        mtime = SEGMENTS_JSONL.stat().st_mtime  # cache key
         chunks, embs, np_index = prepare_corpus(client, mtime)
 
     if not chunks:
         st.error("No recordings found in segments.jsonl")
         st.stop()
 
-    # Optional: small sidebar info
+    # Sidebar info (read-only)
     st.sidebar.write("Model:", CHAT_MODEL)
     st.sidebar.write("Embed:", EMBED_MODEL)
+    st.sidebar.write("OpenAI key:", "✓ set")
 
     # Quick corpus summary
     num_files = len({c["filename"] for c in chunks})
@@ -463,9 +432,7 @@ def main():
                         f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
                     )
 
-        # Persist turn
         st.session_state.chat.append({"q": q, "a": out["answer"], "used": out["used"]})
-
 
 if __name__ == "__main__":
     main()
