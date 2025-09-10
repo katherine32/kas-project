@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Dict
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 import io, zipfile, srt
@@ -20,7 +21,7 @@ except Exception:
     _HAS_OPENAI_V1 = False
 
 # ----------------------------
-# Config
+# Config (transcripts)
 # ----------------------------
 DATA_DIR = Path("data/processed")
 SEGMENTS_JSONL = DATA_DIR / "segments.jsonl"
@@ -29,6 +30,30 @@ CHAT_MODEL = "gpt-4o-mini"               # good quality for demos
 TOP_K = 5
 CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
+
+# ----------------------------
+# Config (census)
+# ----------------------------
+CENSUS_PARQUET = Path("data/census/census.parquet")
+# Prefer variables that look like counts of "Asian alone", then generic "Asian population"
+PREF_VARS = [
+    r"asian\s+alone",
+    r"asian.*(population|estimate|count)",
+    r"\basian\b"
+]
+# Variables that look like total population (for % share)
+TOTAL_VARS = [r"total.*population", r"population.*total", r"overall.*population"]
+
+STATE_NAMES = {
+    "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
+    "delaware","florida","georgia","hawaii","idaho","illinois","indiana","iowa","kansas",
+    "kentucky","louisiana","maine","maryland","massachusetts","michigan","minnesota",
+    "mississippi","missouri","montana","nebraska","nevada","new hampshire","new jersey",
+    "new mexico","new york","north carolina","north dakota","ohio","oklahoma","oregon",
+    "pennsylvania","rhode island","south carolina","south dakota","tennessee","texas",
+    "utah","vermont","virginia","washington","west virginia","wisconsin","wyoming",
+    "district of columbia","washington, dc","dc"
+}
 
 # ----------------------------
 # Secrets / Env helpers
@@ -68,7 +93,7 @@ def ensure_openai_client():
         return _openai
 
 # ----------------------------
-# File bootstrap
+# File bootstrap (transcripts)
 # ----------------------------
 def ensure_segments_on_disk():
     """
@@ -123,7 +148,7 @@ def ensure_segments_on_disk():
         st.stop()
 
 # ----------------------------
-# Utilities
+# Utilities (transcripts)
 # ----------------------------
 def extract_interviewee(filename: str) -> str:
     """Pulls the name from filenames like LP_20151015_Haeng Soon Park_ENG.srt"""
@@ -180,7 +205,7 @@ def merge_segments_to_chunks(
     flush()
     return chunks
 
-# ---------- Embeddings (BATCHED to avoid 300k-token error) ----------
+# ---------- Embeddings (BATCHED to avoid token caps) ----------
 def embed_texts(client, texts: List[str], batch_size: int = 128) -> np.ndarray:
     """
     Return a 2D numpy array (n x d) of embeddings.
@@ -291,7 +316,7 @@ def _write_segments_jsonl(records: List[Dict]):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 # ----------------------------
-# Global-corpus helpers
+# Global-corpus helpers (transcripts)
 # ----------------------------
 def load_all_segments_grouped() -> Dict[str, List[Dict]]:
     """Read segments.jsonl and group records by filename."""
@@ -352,6 +377,111 @@ def diversify_indices(idx: np.ndarray, chunks: List[Dict], k: int, per_file_limi
     return take
 
 # ----------------------------
+# Census loader + query helpers
+# ----------------------------
+@st.cache_resource(show_spinner=False)
+def load_census_df():
+    if not CENSUS_PARQUET.exists():
+        return None
+    df = pd.read_parquet(CENSUS_PARQUET)
+    # ensure helper cols exist (forward compatibility)
+    for c in ["geo_norm", "var_norm", "state_norm"]:
+        if c not in df.columns:
+            if c == "geo_norm":
+                df[c] = df["geo"].astype(str).str.lower()
+            elif c == "var_norm":
+                df[c] = df["variable"].astype(str).str.lower()
+            else:
+                df[c] = df["state"].astype(str).str.lower()
+    return df
+
+def is_census_query(q: str) -> bool:
+    ql = q.lower()
+    keywords = ("population","percent","share","how many","number","estimate","census")
+    asianish = ("asian","aapi","korean","chinese","filipino","vietnamese","indian","pakistani","bangladeshi","japanese")
+    return any(k in ql for k in keywords) and any(a in ql for a in asianish)
+
+def _pick_regex(candidates: list[str], patterns: list[str]) -> list[str]:
+    out = []
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        hits = [c for c in candidates if rx.search(str(c))]
+        if hits:
+            out.extend(hits)
+            break
+    return out
+
+def find_geo_rows(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    ql = q.lower()
+    # 1) if a state name appears, filter by it
+    state_hits = [s for s in STATE_NAMES if s in ql]
+    if state_hits:
+        df = df[df["state_norm"].isin(state_hits)]
+    # 2) try exact/substring match on 'geo' (county/place/etc.); prefer longest hit
+    geos = df["geo"].dropna().astype(str).unique().tolist()
+    subs = [g for g in geos if g.lower() in ql or ql in g.lower()]
+    if subs:
+        subs = sorted(subs, key=lambda x: len(x), reverse=True)
+        df = df[df["geo"] == subs[0]]
+    return df
+
+def pick_variable_rows(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    vars_unique = df["var_norm"].dropna().unique().tolist()
+    picks = _pick_regex(vars_unique, PREF_VARS)
+    if not picks:
+        return df  # fallback: let downstream choose first available numeric
+    return df[df["var_norm"].isin([p.lower() for p in picks])]
+
+def answer_from_census(question: str, census_df: pd.DataFrame) -> Dict:
+    if census_df is None or census_df.empty:
+        return {"answer": "Census dataset not loaded. Please run the census ingest step.", "used_census": []}
+
+    narrowed = find_geo_rows(census_df, question)
+    if narrowed.empty:
+        return {"answer": "I couldn’t match a geography in your question. Try including a state, county, or city name.", "used_census": []}
+
+    narrowed = pick_variable_rows(narrowed, question)
+    if narrowed.empty:
+        return {"answer": "I couldn’t identify an ‘Asian’ population column in your spreadsheets.", "used_census": []}
+
+    # Prefer most recent year with data
+    if "year" in narrowed.columns and narrowed["year"].notna().any():
+        yr = pd.to_numeric(narrowed["year"], errors="coerce")
+        narrowed = narrowed.assign(_yr=yr)
+        narrowed = narrowed.dropna(subset=["_yr"]).sort_values("_yr")
+        latest_year = int(narrowed["_yr"].max())
+        narrowed = narrowed[narrowed["_yr"] == latest_year]
+    else:
+        latest_year = None
+
+    # If we have a total population var, compute % share
+    vars_unique = narrowed["var_norm"].dropna().unique().tolist()
+    total_candidates = _pick_regex(vars_unique, TOTAL_VARS)
+    share_line = ""
+    if total_candidates:
+        tot_df = narrowed[narrowed["var_norm"].isin([total_candidates[0].lower()])]
+        asian_df = narrowed[~narrowed["var_norm"].isin([total_candidates[0].lower()])]
+        pop_total = pd.to_numeric(tot_df["value"], errors="coerce").dropna().max() if not tot_df.empty else None
+        asian_val = pd.to_numeric(asian_df["value"], errors="coerce").dropna().max() if not asian_df.empty else None
+        if pop_total and asian_val is not None and pop_total > 0:
+            share_val = 100.0 * float(asian_val) / float(pop_total)
+            share_line = f" (≈ {share_val:.1f}% of total population)"
+
+    # Build a compact answer
+    narrowed = narrowed.sort_values(["variable","year"])
+    sample = narrowed.iloc[0]
+    geo = str(sample["geo"])
+    asian_var = str(sample["variable"])
+    val = int(float(sample["value"]))
+    year_str = f" in {latest_year}" if latest_year else ""
+    answer = f"{val:,} Asian (from “{asian_var}”){share_line} in **{geo}**{year_str}."
+
+    # Citations: show all contributing rows with file/sheet/variable/year
+    used = narrowed[["geo","variable","value","year","source_file","sheet"]].copy()
+    used = used.sort_values(["variable","year"]).to_dict(orient="records")
+    return {"answer": answer, "used_census": used}
+
+# ----------------------------
 # UI
 # ----------------------------
 def main():
@@ -380,6 +510,13 @@ def main():
     st.sidebar.write("Embed:", EMBED_MODEL)
     st.sidebar.write("OpenAI key:", "✓ set")
 
+    # Load census dataset (if present)
+    census_df = load_census_df()
+    if census_df is None:
+        st.sidebar.warning("Census: no data loaded (run `python -m src.ingest_census`).")
+    else:
+        st.sidebar.write(f"Census rows: {len(census_df):,}")
+
     # Quick corpus summary
     num_files = len({c["filename"] for c in chunks})
     st.info(
@@ -403,6 +540,8 @@ def main():
         if "a" in turn:
             with st.chat_message("assistant"):
                 st.markdown(turn["a"])
+
+                # Transcript citations (if present)
                 used = turn.get("used") or []
                 if used:
                     with st.expander("Cited segments"):
@@ -413,26 +552,61 @@ def main():
                                 f"{c['start_ts']}–{c['end_ts']}**  \n"
                                 f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
                             )
+                # Census citations (if present)
+                used_census = turn.get("used_census") or []
+                if used_census:
+                    with st.expander("Census sources"):
+                        for i, r in enumerate(used_census, 1):
+                            yr = r.get("year", "")
+                            val = r.get("value", "")
+                            st.markdown(
+                                f"**{i}. {r['geo']} — {r['variable']}** "
+                                f"{'('+str(yr)+')' if pd.notna(yr) and yr!='' else ''}  \n"
+                                f"Value: {int(float(val)) if pd.notna(val) and str(val)!='' else val:,}  \n"
+                                f"Source: {r['source_file']} / {r['sheet']}"
+                            )
 
     # -------- Chat input --------
     q = st.chat_input("Ask about the archive (e.g., themes of immigration, identity, foodways)…")
     if q:
         with st.chat_message("user"):
             st.markdown(q)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                out = answer_question(client, q, chunks, embs, np_index)
-            st.markdown(out["answer"])
-            with st.expander("Cited segments"):
-                for i, c in enumerate(out["used"], 1):
-                    who = c.get("interviewee") or extract_interviewee(c["filename"])
-                    st.markdown(
-                        f"**{i}. {who} — {Path(c['filename']).stem} "
-                        f"{c['start_ts']}–{c['end_ts']}**  \n"
-                        f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
-                    )
 
-        st.session_state.chat.append({"q": q, "a": out["answer"], "used": out["used"]})
+        # Route: census questions use deterministic answers from parquet; else transcript RAG
+        if is_census_query(q) and census_df is not None:
+            with st.chat_message("assistant"):
+                out = answer_from_census(q, census_df)
+                st.markdown(out["answer"])
+                if out.get("used_census"):
+                    with st.expander("Census sources"):
+                        for i, r in enumerate(out["used_census"], 1):
+                            yr = r.get("year", "")
+                            val = r.get("value", "")
+                            st.markdown(
+                                f"**{i}. {r['geo']} — {r['variable']}** "
+                                f"{'('+str(yr)+')' if pd.notna(yr) and yr!='' else ''}  \n"
+                                f"Value: {int(float(val)) if pd.notna(val) and str(val)!='' else val:,}  \n"
+                                f"Source: {r['source_file']} / {r['sheet']}"
+                            )
+            # Persist turn
+            st.session_state.chat.append({"q": q, "a": out["answer"], "used_census": out.get("used_census", [])})
+
+        else:
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    out = answer_question(client, q, chunks, embs, np_index)
+                st.markdown(out["answer"])
+                if out.get("used"):
+                    with st.expander("Cited segments"):
+                        for i, c in enumerate(out["used"], 1):
+                            who = c.get("interviewee") or extract_interviewee(c["filename"])
+                            st.markdown(
+                                f"**{i}. {who} — {Path(c['filename']).stem} "
+                                f"{c['start_ts']}–{c['end_ts']}**  \n"
+                                f"{c['text'][:500]}{'…' if len(c['text'])>500 else ''}"
+                            )
+            # Persist turn
+            st.session_state.chat.append({"q": q, "a": out["answer"], "used": out.get("used", [])})
 
 if __name__ == "__main__":
     main()
