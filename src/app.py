@@ -31,6 +31,14 @@ TOP_K = 5
 CHUNK_TARGET_CHARS = 900
 CHUNK_OVERLAP_CHARS = 180
 
+# Prebuilt / bootstrap
+INDEX_DIR = Path("data/index")
+CHUNKS_PARQUET = INDEX_DIR / "chunks.parquet"
+EMBS_NPY = INDEX_DIR / "embeddings.npy"
+NORMED_NPY = INDEX_DIR / "embeddings_normed.npy"
+MANIFEST_JSON = INDEX_DIR / "manifest.json"
+BOOTSTRAP_SEGMENTS = Path("data/bootstrap/segments.jsonl")
+
 # ----------------------------
 # Config (census)
 # ----------------------------
@@ -97,23 +105,32 @@ def ensure_openai_client():
 # ----------------------------
 def ensure_segments_on_disk():
     """
-    If segments.jsonl is missing, let the user upload either:
-    - segments.jsonl, or a single .srt, or a .zip of SRTs.
-    Then build segments.jsonl here on the server.
+    Ensure data/processed/segments.jsonl exists.
+    Priority:
+      (1) If it's already there, use it.
+      (2) Else, if a bootstrap copy exists in data/bootstrap/, copy it.
+      (3) Else, prompt for upload (.jsonl / .srt / .zip).
     """
     if SEGMENTS_JSONL.exists():
         return
 
+    # (2) Bootstrap path for no-upload cold starts
+    if BOOTSTRAP_SEGMENTS.exists():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SEGMENTS_JSONL.write_bytes(BOOTSTRAP_SEGMENTS.read_bytes())
+        st.success("Loaded transcripts from data/bootstrap/segments.jsonl")
+        return
+
+    # (3) Fallback to uploader
     st.info("No transcript data found. Upload your **segments.jsonl**, a single **.srt**, or a **.zip** of SRTs to begin.")
     uploaded = st.file_uploader("Upload segments.jsonl / .srt / .zip", type=["jsonl", "srt", "zip"])
     if uploaded is None:
         st.stop()
 
     name = uploaded.name.lower()
-
     if name.endswith(".jsonl"):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        (DATA_DIR / "segments.jsonl").write_bytes(uploaded.getvalue())
+        SEGMENTS_JSONL.write_bytes(uploaded.getvalue())
         st.success("segments.jsonl saved. Click **Rerun**.")
         st.stop()
 
@@ -349,32 +366,67 @@ def chunk_all_recordings(grouped: Dict[str, List[Dict]]) -> List[Dict]:
         all_chunks.extend(chs)
     return all_chunks
 
+import hashlib, json as _json
+
+def _sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _save_index_artifacts(chunks: List[Dict], embs: np.ndarray, np_idx: np.ndarray, seg_sha: str):
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    # Save chunks as a parquet for quick reload
+    import pandas as pd
+    pd.DataFrame(chunks).to_parquet(CHUNKS_PARQUET)
+    np.save(EMBS_NPY, embs.astype("float32"))
+    np.save(NORMED_NPY, np_idx.astype("float32"))
+    MANIFEST_JSON.write_text(_json.dumps({
+        "embed_model": EMBED_MODEL,
+        "segments_sha256": seg_sha,
+        "n_chunks": len(chunks),
+        "dim": int(embs.shape[1]),
+    }, indent=2))
+
+def _load_index_artifacts():
+    if not (MANIFEST_JSON.exists() and CHUNKS_PARQUET.exists() and EMBS_NPY.exists() and NORMED_NPY.exists()):
+        return None
+    manifest = _json.loads(MANIFEST_JSON.read_text())
+    if manifest.get("embed_model") != EMBED_MODEL:
+        return None
+    # If segments.jsonl exists, verify it matches the manifest hash
+    if SEGMENTS_JSONL.exists():
+        cur_sha = _sha256_file(SEGMENTS_JSONL)
+        if cur_sha != manifest.get("segments_sha256"):
+            return None
+    import pandas as pd
+    chunks_df = pd.read_parquet(CHUNKS_PARQUET)
+    chunks = chunks_df.to_dict(orient="records")
+    embs = np.load(EMBS_NPY)
+    np_idx = np.load(NORMED_NPY)
+    return chunks, embs, np_idx
+
 @st.cache_resource(show_spinner=False)
 def prepare_corpus(_client, _mtime_key: float):
     """
-    Build a single corpus/index over all recordings.
-    Cache invalidates when segments.jsonl mtime changes.
-    Returns: (chunks, embeddings, np_index)
+    Prefer loading a prebuilt index from data/index/.
+    If missing or stale, build it, save artifacts, then return.
     """
+    pre = _load_index_artifacts()
+    if pre is not None:
+        return pre
+
+    # Build fresh
     grouped = load_all_segments_grouped()
     chunks  = chunk_all_recordings(grouped)
     texts   = [c["text"] for c in chunks]
-    embs    = embed_texts(_client, texts).astype("float32")  # BATCHED
+    embs    = embed_texts(_client, texts).astype("float32")
     np_idx  = build_index_np(embs.copy())
-    return chunks, embs, np_idx
 
-def diversify_indices(idx: np.ndarray, chunks: List[Dict], k: int, per_file_limit: int = 3) -> List[int]:
-    """Limit how many chunks we take per filename to encourage synthesis."""
-    take: List[int] = []
-    counts: Dict[str, int] = defaultdict(int)
-    for i in idx:
-        fn = chunks[int(i)]["filename"]
-        if counts[fn] < per_file_limit:
-            take.append(int(i))
-            counts[fn] += 1
-            if len(take) >= k:
-                break
-    return take
+    seg_sha = _sha256_file(SEGMENTS_JSONL) if SEGMENTS_JSONL.exists() else ""
+    _save_index_artifacts(chunks, embs, np_idx, seg_sha)
+    return chunks, embs, np_idx
 
 # ----------------------------
 # Census loader + query helpers

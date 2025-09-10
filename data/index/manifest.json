@@ -1,0 +1,6 @@
+{
+  "embed_model": "text-embedding-3-small",
+  "segments_sha256": "1cad1bee0109a68d87a018cb215d0a68c9411d4649836719a5c37742044a50f5",
+  "n_chunks": 3382,
+  "dim": 1536
+}
